@@ -1,0 +1,579 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>用紙在庫マップ - Smart Stock Finder</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/html5-qrcode"></script>
+    <!-- Google Fonts & Icons -->
+    <link href="https://fonts.googleapis.com/icon?family=Material+Icons" rel="stylesheet">
+    <style>
+        /* マップ表示エリア */
+        .map-container { 
+            position: relative; 
+            width: 100%; 
+            overflow: hidden; 
+            border-radius: 0.5rem; 
+            background: #2d3748; 
+            touch-action: pan-x pan-y; /* スクロール操作を許可 */
+        }
+        
+        /* グリッドレイヤー */
+        .grid-overlay {
+            display: grid;
+            position: absolute;
+            top: 0; left: 0; width: 100%; height: 100%;
+            pointer-events: none; /* 通常はクリックを透過 */
+        }
+
+        /* 個別のセル */
+        .grid-cell {
+            border: 1px solid rgba(255, 255, 255, 0.05);
+            position: relative;
+            pointer-events: all; /* セル自体はクリック可能 */
+            cursor: pointer;
+            transition: all 0.2s;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        /* 編集モード時のスタイル */
+        body.edit-mode .grid-cell {
+            border: 1px dashed rgba(255, 255, 0, 0.3);
+            background: rgba(0, 0, 0, 0.2);
+        }
+        body.edit-mode .grid-cell:hover {
+            background: rgba(255, 255, 0, 0.2);
+        }
+
+        /* ハイライト（検索ヒット時） */
+        .grid-cell.active {
+            background: rgba(239, 68, 68, 0.6) !important; /* text-red-500 */
+            border: 2px solid #ef4444 !important;
+            box-shadow: 0 0 15px #ef4444;
+            z-index: 20;
+            animation: pulse 1.5s infinite;
+        }
+
+        /* マッピング済みセルの表示 */
+        .grid-cell.mapped {
+            background: rgba(59, 130, 246, 0.1); /* 薄い青 */
+        }
+        .grid-cell.mapped::after {
+            content: attr(data-address);
+            position: absolute;
+            top: 2px; left: 2px;
+            font-size: 8px;
+            color: rgba(255,255,255,0.7);
+            background: rgba(0,0,0,0.5);
+            padding: 1px 3px;
+            border-radius: 2px;
+            pointer-events: none;
+        }
+
+        /* 段数表示などのインジケータ */
+        .info-bubble {
+            position: absolute;
+            bottom: 110%; left: 50%; transform: translateX(-50%);
+            background: #1f2937; color: white; padding: 4px 8px;
+            border-radius: 6px; font-weight: bold; font-size: 12px;
+            white-space: nowrap; pointer-events: none; 
+            opacity: 0; transition: opacity 0.3s;
+            z-index: 30;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.3);
+        }
+        .info-bubble::after {
+            content: ''; position: absolute; top: 100%; left: 50%; margin-left: -5px;
+            border-width: 5px; border-style: solid; border-color: #1f2937 transparent transparent transparent;
+        }
+        .active .info-bubble { opacity: 1; bottom: 120%; }
+
+        @keyframes pulse {
+            0% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.7); }
+            70% { box-shadow: 0 0 0 10px rgba(239, 68, 68, 0); }
+            100% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0); }
+        }
+    </style>
+</head>
+<body class="bg-gray-50 text-gray-800 h-screen flex flex-col overflow-hidden">
+
+    <!-- ヘッダー -->
+    <header class="bg-blue-900 text-white p-4 shadow-lg flex justify-between items-center shrink-0 z-10">
+        <div class="flex items-center gap-2">
+            <span class="material-icons text-blue-300">inventory_2</span>
+            <div>
+                <h1 class="text-lg font-bold leading-tight">用紙在庫マップ</h1>
+                <p class="text-xs text-blue-200">DX Stock Finder</p>
+            </div>
+        </div>
+        <div id="target-display" class="text-xl font-mono font-bold text-yellow-300"></div>
+    </header>
+
+    <!-- メインコンテンツ (スクロール可能) -->
+    <main class="flex-1 overflow-auto p-4 space-y-4">
+        
+        <!-- アクションエリア -->
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <!-- スキャン・検索 -->
+            <div class="bg-white p-4 rounded-xl shadow-sm border border-gray-100">
+                <div class="flex gap-2 mb-3">
+                    <input id="search-input" type="text" class="flex-1 border border-gray-300 rounded-lg px-3 py-2 text-lg uppercase focus:ring-2 focus:ring-blue-500 outline-none" placeholder="番地 (例: A-1-2)">
+                    <button id="search-btn" class="bg-blue-600 hover:bg-blue-700 text-white px-4 rounded-lg font-bold flex items-center">
+                        <span class="material-icons">search</span>
+                    </button>
+                    <button id="scan-trigger" class="bg-gray-800 hover:bg-gray-900 text-white px-4 rounded-lg font-bold flex items-center gap-1">
+                        <span class="material-icons">qr_code_scanner</span>
+                        <span class="hidden sm:inline">読取</span>
+                    </button>
+                </div>
+                
+                <div id="reader-container" class="hidden transition-all duration-300">
+                    <div id="reader" class="rounded-lg overflow-hidden border-2 border-gray-300"></div>
+                    <button onclick="stopScanner()" class="w-full mt-2 py-2 text-sm text-red-500 font-bold hover:bg-red-50 rounded">カメラを閉じる</button>
+                </div>
+
+                <!-- 検索結果アクション -->
+                <div id="result-action" class="hidden mt-3 p-3 bg-green-50 border border-green-200 rounded-lg flex justify-between items-center animate-pulse">
+                    <div>
+                        <p class="text-xs text-green-700 font-bold">場所を特定しました</p>
+                        <p class="text-sm">在庫数を確認・変更しますか？</p>
+                    </div>
+                    <a id="kintone-link" href="#" target="_blank" class="bg-green-600 text-white text-sm px-3 py-2 rounded-lg font-bold hover:bg-green-700 flex items-center gap-1">
+                        詳細 <span class="material-icons text-sm">open_in_new</span>
+                    </a>
+                </div>
+            </div>
+
+            <!-- ステータス・ガイド -->
+            <div class="bg-blue-50 p-4 rounded-xl border border-blue-100 text-sm">
+                <p class="font-bold text-blue-800 mb-1 flex items-center gap-1">
+                    <span class="material-icons text-sm">info</span> 利用ガイド
+                </p>
+                <ul class="list-disc list-inside text-gray-600 space-y-1">
+                    <li>番地のQRコードを読み込むとマップが光ります</li>
+                    <li>kintone上の番地「A-01」などに対応</li>
+                    <li><span class="font-bold text-gray-800">管理者機能:</span> マップをクリックして実際の番地名を登録可能</li>
+                </ul>
+            </div>
+        </div>
+
+        <!-- マップ表示エリア -->
+        <div class="bg-white p-2 rounded-xl shadow-lg border border-gray-200 relative">
+            <div class="flex justify-between items-center mb-2 px-2">
+                <h2 class="font-bold text-gray-700">フロアマップ</h2>
+                <div class="flex gap-2">
+                    <label class="flex items-center gap-1 cursor-pointer select-none">
+                        <input type="checkbox" id="edit-mode-toggle" class="form-checkbox h-4 w-4 text-blue-600">
+                        <span class="text-xs font-bold text-gray-500">番地編集モード</span>
+                    </label>
+                </div>
+            </div>
+
+            <div class="map-container shadow-inner bg-gray-800" id="map-scroll-area">
+                <!-- 画像がない場合のプレースホルダー -->
+                <div id="no-image-placeholder" class="absolute inset-0 flex items-center justify-center text-gray-500">
+                    <div class="text-center">
+                        <span class="material-icons text-4xl">map</span>
+                        <p class="text-xs mt-1">マップ画像を設定してください</p>
+                    </div>
+                </div>
+                
+                <img id="floor-img" src="" class="w-full h-auto block opacity-80" style="min-height: 300px; object-fit: contain;">
+                <div id="grid-parent" class="grid-overlay"></div>
+            </div>
+        </div>
+
+        <!-- 管理者設定エリア（アコーディオン） -->
+        <details class="bg-gray-200 rounded-xl overflow-hidden text-xs">
+            <summary class="p-3 font-bold cursor-pointer hover:bg-gray-300 select-none flex justify-between">
+                <span>🔧 管理者設定（マップ・グリッド調整）</span>
+                <span class="material-icons text-sm">expand_more</span>
+            </summary>
+            <div class="p-4 space-y-3 bg-gray-100 border-t border-gray-300">
+                <div>
+                    <label class="block mb-1 font-bold">マップ画像:</label>
+                    <input type="file" id="map-upload" accept="image/*" class="w-full bg-white border p-1 rounded">
+                </div>
+                <div class="grid grid-cols-2 gap-3">
+                    <div>
+                        <label class="block mb-1 font-bold">横のマス数 (X):</label>
+                        <input type="number" id="grid-x" value="10" class="w-full p-2 border rounded text-center">
+                    </div>
+                    <div>
+                        <label class="block mb-1 font-bold">縦のマス数 (Y):</label>
+                        <input type="number" id="grid-y" value="10" class="w-full p-2 border rounded text-center">
+                    </div>
+                </div>
+                <div class="flex gap-2 pt-2">
+                    <button id="save-settings" class="flex-1 bg-gray-700 text-white py-2 rounded font-bold hover:bg-gray-800">設定を保存</button>
+                    <button id="clear-mapping" class="px-3 bg-red-100 text-red-600 border border-red-200 rounded hover:bg-red-200">番地定義リセット</button>
+                </div>
+            </div>
+        </details>
+        
+        <div class="h-8"></div><!-- Spacer -->
+    </main>
+
+    <!-- モーダル：番地編集用 -->
+    <div id="edit-modal" class="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center hidden z-50">
+        <div class="bg-white p-5 rounded-xl shadow-2xl w-80">
+            <h3 class="font-bold text-lg mb-2 text-gray-800">番地を割り当て</h3>
+            <p class="text-xs text-gray-500 mb-4">この場所に対応するQRコードの番地を入力してください。</p>
+            <input id="edit-address-input" type="text" class="w-full border-2 border-blue-200 rounded-lg p-2 text-xl font-mono uppercase mb-4 focus:ring-2 focus:ring-blue-500 outline-none" placeholder="例: A-1">
+            <div class="flex justify-end gap-2">
+                <button onclick="closeModal()" class="px-4 py-2 text-gray-600 font-bold hover:bg-gray-100 rounded">キャンセル</button>
+                <button id="save-mapping-btn" class="px-4 py-2 bg-blue-600 text-white font-bold rounded hover:bg-blue-700 shadow">保存</button>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // --- 設定と定数 ---
+        const STORAGE_KEY = 'dx_stock_config';
+        const MAPPING_KEY = 'dx_stock_mapping';
+        
+        // デフォルト設定
+        let config = JSON.parse(localStorage.getItem(STORAGE_KEY)) || {
+            img: '', x: 10, y: 10
+        };
+        // 番地マッピング: { "cellId": "UserDefinedAddress", ... }
+        // 例: { "5-3": "A-01" }  (グリッドのx-y座標に対して、ユーザーが定義した番地名)
+        let addressMapping = JSON.parse(localStorage.getItem(MAPPING_KEY)) || {};
+
+        let scanner = null;
+        let selectedCellId = null; // 編集モードで選択中のセルID
+
+        // DOM要素
+        const els = {
+            floorImg: document.getElementById('floor-img'),
+            gridParent: document.getElementById('grid-parent'),
+            targetDisplay: document.getElementById('target-display'),
+            searchInput: document.getElementById('search-input'),
+            searchBtn: document.getElementById('search-btn'),
+            scanTrigger: document.getElementById('scan-trigger'),
+            readerContainer: document.getElementById('reader-container'),
+            mapUpload: document.getElementById('map-upload'),
+            saveSettings: document.getElementById('save-settings'),
+            gridX: document.getElementById('grid-x'),
+            gridY: document.getElementById('grid-y'),
+            editModeToggle: document.getElementById('edit-mode-toggle'),
+            editModal: document.getElementById('edit-modal'),
+            editAddressInput: document.getElementById('edit-address-input'),
+            saveMappingBtn: document.getElementById('save-mapping-btn'),
+            resultAction: document.getElementById('result-action'),
+            kintoneLink: document.getElementById('kintone-link'),
+            clearMappingBtn: document.getElementById('clear-mapping'),
+            noImagePlaceholder: document.getElementById('no-image-placeholder')
+        };
+
+        // --- 初期化 ---
+        function init() {
+            // UIへの設定反映
+            els.gridX.value = config.x;
+            els.gridY.value = config.y;
+            if (config.img) {
+                els.floorImg.src = config.img;
+                els.noImagePlaceholder.style.display = 'none';
+            }
+
+            renderMap();
+            
+            // イベントリスナー
+            els.searchBtn.onclick = () => locate(els.searchInput.value);
+            els.searchInput.addEventListener('keypress', (e) => { if (e.key === 'Enter') locate(els.searchInput.value); });
+            
+            els.scanTrigger.onclick = startScanner;
+            els.saveSettings.onclick = saveConfig;
+            
+            els.editModeToggle.onchange = (e) => {
+                document.body.classList.toggle('edit-mode', e.target.checked);
+            };
+
+            els.saveMappingBtn.onclick = saveMapping;
+            els.clearMappingBtn.onclick = () => {
+                if(confirm('すべての番地割り当て設定を削除しますか？')) {
+                    addressMapping = {};
+                    localStorage.removeItem(MAPPING_KEY);
+                    renderMap();
+                }
+            };
+
+            // URLパラメータチェック (kintoneからの遷移用)
+            checkUrlParams();
+        }
+
+        // --- マップ描画 ---
+        function renderMap() {
+            // グリッドレイアウト設定
+            els.gridParent.style.gridTemplateColumns = `repeat(${config.x}, 1fr)`;
+            els.gridParent.style.gridTemplateRows = `repeat(${config.y}, 1fr)`;
+            els.gridParent.innerHTML = '';
+
+            const totalCells = config.x * config.y;
+
+            for (let i = 0; i < totalCells; i++) {
+                const x = i % config.x;
+                const y = Math.floor(i / config.x);
+                const cellKey = `${x}-${y}`; // 内部座標キー
+                
+                const cell = document.createElement('div');
+                cell.className = 'grid-cell';
+                cell.dataset.key = cellKey;
+                
+                // マッピングされている番地があれば表示
+                const mappedAddr = getMappedAddress(cellKey);
+                if (mappedAddr) {
+                    cell.classList.add('mapped');
+                    cell.dataset.address = mappedAddr;
+                }
+
+                // インジケータ（吹き出し）
+                cell.innerHTML = `
+                    <div class="info-bubble">
+                        <span class="addr-text">${mappedAddr || (numToAlpha(x) + (y+1))}</span>
+                    </div>
+                `;
+
+                // クリックイベント：通常時は場所表示、編集時は設定
+                cell.onclick = () => handleCellClick(cellKey, mappedAddr);
+                
+                els.gridParent.appendChild(cell);
+            }
+        }
+
+        // --- 座標変換ユーティリティ ---
+        function numToAlpha(num) {
+            // 0 -> A, 1 -> B ... 26 -> AA (簡易版)
+            return String.fromCharCode(65 + (num % 26));
+        }
+
+        function getMappedAddress(cellKey) {
+            // key "5-3" -> returns "A-01" if exists
+            return Object.keys(addressMapping).find(key => addressMapping[key] === cellKey) || null; // 逆引きではなく順引きが必要
+            // addressMappingの構造: { "5-3": "A-01" } (key=cell, val=addr)
+            return addressMapping[cellKey];
+        }
+
+        // --- インタラクション ---
+        function handleCellClick(cellKey, currentAddr) {
+            if (els.editModeToggle.checked) {
+                // 編集モード：モーダルを開く
+                selectedCellId = cellKey;
+                els.editAddressInput.value = currentAddr || "";
+                els.editModal.classList.remove('hidden');
+                setTimeout(() => els.editAddressInput.focus(), 100);
+            } else {
+                // 通常モード：その場所の情報を表示（必要であれば）
+                // 逆引き用に番地をinputに入れて検索するような動作も可能
+                if (currentAddr) {
+                    els.searchInput.value = currentAddr;
+                    locate(currentAddr);
+                }
+            }
+        }
+
+        function saveMapping() {
+            const val = els.editAddressInput.value.trim().toUpperCase();
+            if (selectedCellId) {
+                if (val) {
+                    addressMapping[selectedCellId] = val;
+                } else {
+                    delete addressMapping[selectedCellId]; // 空なら削除
+                }
+                localStorage.setItem(MAPPING_KEY, JSON.stringify(addressMapping));
+                renderMap();
+                closeModal();
+            }
+        }
+
+        function closeModal() {
+            els.editModal.classList.add('hidden');
+            selectedCellId = null;
+        }
+
+        // --- 検索・特定ロジック (重要) ---
+        function locate(input) {
+            if (!input) return;
+            
+            // 1. 入力値の正規化 (kintone URL対応など)
+            let rawAddress = input;
+            
+            // kintoneのURLなどが渡された場合の簡易抽出
+            // 例: https://subdomain.cybozu.com/k/123/show#...&address=A-01...
+            // または、URL内に直接番地が含まれていない場合、input自体を番地とみなす
+            try {
+                if (input.startsWith('http')) {
+                    const url = new URL(input);
+                    const params = new URLSearchParams(url.search);
+                    // クエリパラメータに 'address' や 'loc' があれば採用
+                    if (params.get('address')) rawAddress = params.get('address');
+                    else if (params.get('loc')) rawAddress = params.get('loc');
+                    // ハッシュパラメータ対応 (kintoneはハッシュを使うことが多い)
+                    else if (url.hash.includes('address=')) {
+                        const hashParams = new URLSearchParams(url.hash.substring(1)); // #除去
+                        if (hashParams.get('address')) rawAddress = hashParams.get('address');
+                    }
+                    // URL自体に番地が含まれていなければ、どうしようもないのでURLを文字列として扱うのは避ける
+                    // ここでは「QRには番地文字列が入っている」という運用を前提にする
+                }
+            } catch (e) { console.error("URL Parse Error", e); }
+
+            // 検索用に大文字化＆トリム
+            const targetAddr = rawAddress.trim().toUpperCase();
+            
+            // UI更新
+            els.targetDisplay.innerText = targetAddr;
+            els.resultAction.classList.remove('hidden');
+            // ダミーのkintoneリンク（実運用では動的に生成可能）
+            els.kintoneLink.href = `https://kintone.cybozu.co.jp/search?q=${targetAddr}`; 
+
+            // 2. マップ上のマッチング
+            document.querySelectorAll('.grid-cell').forEach(c => c.classList.remove('active'));
+            
+            let matchedCell = null;
+
+            // A. マッピング定義からの検索 (完全一致優先)
+            const mappedKey = Object.keys(addressMapping).find(key => addressMapping[key] === targetAddr);
+            
+            if (mappedKey) {
+                matchedCell = document.querySelector(`.grid-cell[data-key="${mappedKey}"]`);
+            } 
+            // B. マッピング定義からの検索 (前方一致 - 棚番のみでヒットさせる場合など)
+            else {
+                // 例: 入力が "A-01-3段目" だが、マップには "A-01" しか定義されていない場合
+                const partialKey = Object.keys(addressMapping).find(key => targetAddr.startsWith(addressMapping[key]));
+                if (partialKey) {
+                    matchedCell = document.querySelector(`.grid-cell[data-key="${partialKey}"]`);
+                }
+            }
+
+            // C. 自動生成IDへのフォールバック (従来の A1, B2... 形式)
+            // マッピングがない場合の予備動作
+            if (!matchedCell) {
+                // 入力から "A1" や "W5" のような座標成分を取り出す
+                // 正規表現: アルファベット + 数字
+                const match = targetAddr.match(/^([A-Z]+)([0-9]+)/);
+                if (match) {
+                    const colStr = match[1]; // "A"
+                    const rowNum = parseInt(match[2]); // 1
+                    
+                    // A -> 0, B -> 1 ... 簡易変換
+                    const colIndex = colStr.charCodeAt(0) - 65; 
+                    const rowIndex = rowNum - 1;
+
+                    if (colIndex >= 0 && colIndex < config.x && rowIndex >= 0 && rowIndex < config.y) {
+                        matchedCell = document.querySelector(`.grid-cell[data-key="${colIndex}-${rowIndex}"]`);
+                    }
+                }
+            }
+
+            // 3. 結果表示
+            if (matchedCell) {
+                matchedCell.classList.add('active');
+                
+                // 吹き出しテキスト更新
+                const bubble = matchedCell.querySelector('.addr-text');
+                if (bubble) bubble.innerText = targetAddr; // 入力された詳細な番地を表示
+
+                matchedCell.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            } else {
+                alert(`マップ上に番地「${targetAddr}」が見つかりませんでした。\n編集モードでマップ上の位置にこの番地を割り当ててください。`);
+            }
+        }
+
+        // --- QRスキャナー ---
+        function startScanner() {
+            if (scanner) return;
+            els.readerContainer.classList.remove('hidden');
+            
+            scanner = new Html5QrcodeScanner("reader", { 
+                fps: 10, 
+                qrbox: { width: 250, height: 250 },
+                aspectRatio: 1.0
+            });
+            
+            scanner.render((decodedText) => {
+                stopScanner();
+                els.searchInput.value = decodedText;
+                locate(decodedText);
+            }, (error) => {
+                // 読み取り中のエラーは無視
+            });
+        }
+
+        function stopScanner() {
+            if (scanner) {
+                scanner.clear().then(() => {
+                    scanner = null;
+                    els.readerContainer.classList.add('hidden');
+                });
+            } else {
+                els.readerContainer.classList.add('hidden');
+            }
+        }
+
+        // --- 設定保存 ---
+        function saveConfig() {
+            const file = els.mapUpload.files[0];
+            const newX = parseInt(els.gridX.value);
+            const newY = parseInt(els.gridY.value);
+
+            // ローカルストレージ保存のヘルパー (エラーハンドリング付き)
+            const saveToStorage = (newConfig) => {
+                try {
+                    localStorage.setItem(STORAGE_KEY, JSON.stringify(newConfig));
+                    config = newConfig; // グローバル設定を更新
+
+                    // 重要な修正: 設定保存後、即座に画像を反映させる
+                    if (config.img) {
+                        els.floorImg.src = config.img;
+                        els.noImagePlaceholder.style.display = 'none';
+                    } else {
+                        els.floorImg.src = '';
+                        els.noImagePlaceholder.style.display = 'flex';
+                    }
+
+                    renderMap();
+                    alert('設定を保存しました');
+                } catch (e) {
+                    console.error("Storage Error:", e);
+                    if (e.name === 'QuotaExceededError' || e.name === 'NS_ERROR_DOM_QUOTA_REACHED') {
+                        alert('【エラー】画像サイズが大きすぎて保存できませんでした。\n\n・より解像度の低い画像を使用してください\n・画像を圧縮してからアップロードしてください');
+                    } else {
+                        alert('設定の保存中にエラーが発生しました。');
+                    }
+                }
+            };
+
+            if (file) {
+                const reader = new FileReader();
+                reader.onload = (e) => {
+                    const imgData = e.target.result;
+                    // 画像サイズチェックの目安（Base64文字列長でおおよそ判断）
+                    if (imgData.length > 4000000) { // 約3-4MB
+                        alert('警告: 画像サイズが大きいため、保存できない可能性があります。');
+                    }
+                    saveToStorage({ img: imgData, x: newX, y: newY });
+                };
+                reader.readAsDataURL(file);
+            } else {
+                // 画像変更なし
+                saveToStorage({ img: config.img, x: newX, y: newY });
+            }
+        }
+
+        // --- URLパラメータ処理 ---
+        function checkUrlParams() {
+            const params = new URLSearchParams(window.location.search);
+            const addr = params.get('address') || params.get('q');
+            if (addr) {
+                setTimeout(() => locate(addr), 500); // 描画待ち
+            }
+        }
+
+        init();
+    </script>
+</body>
+</html>
